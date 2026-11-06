@@ -1,0 +1,9 @@
+{
+  "name": "tapo-motion-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Record Tapo motion clips as local MP4s on NixOS",
+  "engines": { "node": ">=22.10.0 <23 || >=24 <25" },
+  "scripts": { "start": "node src/cli.cjs" },
+  "dependencies": { "homebridge-tapo-direct": "0.2.2" }
+}

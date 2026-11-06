@@ -1,0 +1,19 @@
+/.tapo-runtime/
+/Record Tapo Motion.command
+/recordings/
+/node_modules/
+/result
+/result-*
+config.json
+camera-tokens*.json
+tapo-camera-tokens*.json
+*.app/
+.env
+.env.*
+*.log
+*.mp4
+*.jpg
+*.apk
+*.partial
+__pycache__/
+.DS_Store
