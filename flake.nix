@@ -30,6 +30,27 @@
           default = installer;
           install = installer;
           tapo-login = app "tapo-login" "Refresh local camera tokens through TP-Link sign-in";
+          refresh = app "tapo-refresh" "Refresh tokens for an existing user service";
+          status = app "tapo-status" "Show recorder and camera health";
+          doctor = app "tapo-doctor" "Check camera discovery, video, and recording storage";
+        }
+      );
+
+      checks = eachSystem (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          recorder-service = pkgs.testers.runNixOSTest {
+            imports = [ ./test/nixos-service.nix ];
+            requiredFeatures.kvm = system == "x86_64-linux";
+            qemu.forceAccel = system == "x86_64-linux";
+            node.specialArgs = {
+              recorderModule = self.nixosModules.default;
+              recorderPackage = self.packages.${system}.default;
+            };
+          };
         }
       );
 

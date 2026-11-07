@@ -3,6 +3,7 @@
 
 import argparse
 import datetime
+import errno
 import ipaddress
 import json
 import math
@@ -13,6 +14,10 @@ import struct
 import subprocess
 import time
 import zlib
+
+
+STATUS_INTERVAL = 5
+MAX_ALARM_TIMESTAMP = 253402300799
 
 
 def discovery_body():
@@ -44,26 +49,56 @@ def local_time(timestamp):
         return "unknown"
 
 
+def emit(event_type, **fields):
+    print(json.dumps({"type": event_type, **fields}), flush=True)
+
+
+def alarm_value(value):
+    if value is None:
+        return 0
+    if type(value) is int and 0 <= value <= MAX_ALARM_TIMESTAMP:
+        return value
+    return None
+
+
 def watch(hosts, duration, events, poll_interval=0.25):
     body = discovery_body()
     latest = {}
+    last_reply = {}
+    probe_errors = {}
     deadline = time.monotonic() + duration if duration is not None else float("inf")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        if events:
+            emit("ready")
         while time.monotonic() < deadline:
             packet = discovery_packet(body)
             for host in hosts:
-                udp.sendto(packet, (host, 20004))
+                try:
+                    udp.sendto(packet, (host, 20004))
+                except OSError as error:
+                    now = time.monotonic()
+                    previous = probe_errors.get(host)
+                    if previous is None or error.errno != previous[0] or now - previous[1] >= STATUS_INTERVAL:
+                        probe_errors[host] = (error.errno, now)
+                        reason = errno.errorcode.get(error.errno, "unknown error")
+                        if events:
+                            emit("error", host=host, reason=f"UDP probe failed ({reason})")
 
             round_end = min(deadline, time.monotonic() + poll_interval)
             while (remaining := round_end - time.monotonic()) > 0:
                 if not select.select([udp], [], [], remaining)[0]:
                     break
-                data, (host, port) = udp.recvfrom(16384)
+                try:
+                    data, (host, port) = udp.recvfrom(16384)
+                except OSError:
+                    # A transient socket error cannot identify a camera on an
+                    # unconnected UDP socket. Start another polling round.
+                    break
                 if host not in hosts or port != 20004:
                     continue
                 try:
                     result = json.loads(data[16:]).get("result", {})
-                except (AttributeError, ValueError):
+                except (AttributeError, ValueError, RecursionError):
                     continue
                 if not isinstance(result, dict) or result.get("device_type") != "SMART.IPCAMERA":
                     continue
@@ -71,11 +106,15 @@ def watch(hosts, duration, events, poll_interval=0.25):
                 current = (result.get("last_alarm_time"), result.get("sd_status"))
                 previous = latest.get(host)
                 if events:
-                    alarm, _ = current
-                    if type(alarm) is int and alarm > 0 and (previous is None or alarm > previous):
+                    alarm = alarm_value(current[0])
+                    changed = alarm is not None and (previous is None or alarm > previous)
+                    if changed:
                         latest[host] = alarm
-                        if previous is not None:
-                            print(json.dumps({"host": host, "alarm": alarm}), flush=True)
+                    now = time.monotonic()
+                    recovering = probe_errors.pop(host, None) is not None
+                    if changed or recovering or host not in last_reply or now - last_reply[host] >= STATUS_INTERVAL:
+                        last_reply[host] = now
+                        emit("reply", host=host, alarm=alarm, motion=changed and previous is not None)
                     continue
                 if current != previous:
                     latest[host] = current
@@ -94,7 +133,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("hosts", nargs="+", type=ipaddress.IPv4Address)
     parser.add_argument("--seconds", type=int)
-    parser.add_argument("--events", action="store_true", help="emit new alarms as JSON lines")
+    parser.add_argument("--events", action="store_true", help="emit readiness, camera replies and motion as JSON lines")
     parser.add_argument(
         "--interval", type=float, default=0.25,
         help="seconds between discovery probes (0.1–60; default: 0.25)",

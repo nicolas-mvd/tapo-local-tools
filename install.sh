@@ -3,19 +3,27 @@ set -euo pipefail
 umask 077
 
 usage() {
-    printf '%s\n' 'Usage: tapo-install [--camera-1 IPV4] [--camera-2 IPV4] [--no-linger]'
-    printf '%s\n' 'The first install prompts for any missing camera addresses. A reinstall keeps the configured addresses unless overridden.'
+    printf '%s\n' 'Usage: tapo-install [--camera ID IPV4 NAME]... [--recordings-dir PATH] [--no-linger]' \
+        '       [--retention-days DAYS] [--max-storage-mib MIB] [--min-free-mib MIB] [--clip-seconds SECONDS]' \
+        '       tapo-install --refresh-tokens [--no-linger]' \
+        'The first install prompts for cameras unless supplied. A reinstall keeps settings unless overridden.' \
+        '--camera replaces the camera list. --camera-1 and --camera-2 still update those individual addresses.'
 }
 
 fail() { printf 'Tapo install: %s\n' "$*" >&2; exit 1; }
 
-camera1='' camera2='' linger_requested=1
+profile_args=() linger_requested=1
 while (($#)); do
     case "$1" in
-        --camera-1|--camera-2)
-            [[ $# -ge 2 && -n $2 && $2 != --* ]] || fail "$1 needs a private IPv4 address."
-            if [[ $1 == --camera-1 ]]; then camera1=$2; else camera2=$2; fi
+        --camera)
+            [[ $# -ge 4 && -n $2 && -n $3 && -n $4 ]] || fail '--camera needs an ID, IPv4 address, and name.'
+            profile_args+=("$1" "$2" "$3" "$4")
+            shift 4 ;;
+        --camera-1|--camera-2|--recordings-dir|--retention-days|--max-storage-mib|--min-free-mib|--clip-seconds)
+            [[ $# -ge 2 && -n $2 && $2 != --* ]] || fail "$1 needs a value."
+            profile_args+=("$1" "$2")
             shift 2 ;;
+        --refresh-tokens) profile_args+=("$1"); shift ;;
         --no-linger) linger_requested=0; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; fail "Unknown option: $1" ;;
@@ -45,11 +53,11 @@ current=$config_dir/current
 package_root=$state_dir/package
 marker='# Managed by tapo-install'
 
-# These paths become systemd unit values. Reject whitespace, substitutions and
-# specifiers instead of relying on shell quoting rules in the unit parser.
-for dir in "$config_home" "$state_dir" "$data_dir" "$package"; do
+# Systemd paths must work without expansion or quoting. The recordings folder
+# is stored only in JSON and can contain spaces.
+for dir in "$config_home" "$state_dir" "$package"; do
     [[ $dir =~ ^/[A-Za-z0-9_./-]+$ ]] \
-        || fail 'HOME, XDG directories and the Nix package need ordinary absolute paths.'
+        || fail 'The config and state homes and the Nix package need ordinary absolute paths.'
 done
 
 private_dir() {
@@ -59,7 +67,6 @@ private_dir() {
 }
 private_dir "$config_dir"
 private_dir "$state_dir"
-private_dir "$data_dir"
 [[ ! -L $state_dir/install.lock ]] || fail 'Install lock must not be a symlink.'
 exec 9>"$state_dir/install.lock"
 flock -n 9 || fail 'Another Tapo install is running.'
@@ -121,15 +128,6 @@ if [[ -e $package_root || -L $package_root ]]; then
     previous_package=$(readlink -- "$package_root")
 fi
 
-if [[ -z $previous_profile ]]; then
-    if [[ -z $camera1 ]]; then
-        IFS= read -r -p 'Cam 1 private IPv4 address: ' camera1 || fail 'Camera setup canceled.'
-    fi
-    if [[ -z $camera2 ]]; then
-        IFS= read -r -p 'Cam 2 private IPv4 address: ' camera2 || fail 'Camera setup canceled.'
-    fi
-fi
-
 profile=$(mktemp -d -- "$config_dir/.profile.XXXXXXXXXX")
 staged_unit='' activating=0 complete=0 was_active=0 was_enabled=0
 
@@ -176,35 +174,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-python3 - "$previous_profile" "$profile/config.json" "$archive" "$camera1" "$camera2" <<'PY'
-from ipaddress import IPv4Address, IPv4Network
-import json
-from pathlib import Path
-import sys
-
-previous, destination, archive, camera1, camera2 = sys.argv[1:]
-hosts = {}
-try:
-    if previous:
-        old = json.loads((Path(previous) / "config.json").read_text())
-        hosts = {camera["id"]: camera["host"] for camera in old["cameras"]}
-        if set(hosts) != {"1", "2"}:
-            raise ValueError("Existing profile must contain camera IDs 1 and 2.")
-    for camera_id, override in (("1", camera1), ("2", camera2)):
-        host = override or hosts.get(camera_id)
-        if not isinstance(host, str):
-            raise ValueError(f"Camera {camera_id} needs a private IPv4 address.")
-        address = IPv4Address(host)
-        if not any(address in IPv4Network(network) for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
-            raise ValueError(f"Camera {camera_id} needs a private IPv4 address.")
-        hosts[camera_id] = str(address)
-    if hosts["1"] == hosts["2"]:
-        raise ValueError("Camera addresses must be different.")
-except (OSError, KeyError, TypeError, ValueError) as error:
-    sys.exit(f"Tapo camera configuration: {error}")
-config = {"cameras": [{"id": key, "host": hosts[key]} for key in ("1", "2")], "recordingsDir": archive}
-Path(destination).write_text(json.dumps(config, indent=2) + "\n")
-PY
+configure="$(dirname -- "${BASH_SOURCE[0]}")/scripts/configure.py"
+python3 "$configure" "$previous_profile" "$profile/config.json" "$archive" "$state_dir/status.json" "${profile_args[@]}"
+archive=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["recordingsDir"])' < "$profile/config.json")
 
 "$package/bin/tapo-login" --config "$profile/config.json" \
     --token-file "$profile/camera-tokens.json" --require-discovery
@@ -222,6 +194,9 @@ Description=Tapo camera motion recorder
 ConditionPathExists=$current/camera-tokens.json
 
 [Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=45s
 ExecStart=$package/bin/tapo-motion-recorder
 Environment=TAPO_CONFIG=$current/config.json
 LoadCredential=camera-tokens.json:$current/camera-tokens.json

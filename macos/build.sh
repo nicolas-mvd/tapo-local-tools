@@ -44,7 +44,7 @@ npm ci --ignore-scripts --prefix "$resources"
 
 /usr/bin/swiftc -swift-version 5 -O -target "$(uname -m)-apple-macosx13.0" \
     -framework AppKit "$repo/macos/App.swift" "$repo/macos/TapoBridge.swift" \
-    "$repo/macos/LiveWindow.swift" -o "$app/Contents/MacOS/TapoMenu"
+    "$repo/macos/CameraSettings.swift" "$repo/macos/LiveWindow.swift" -o "$app/Contents/MacOS/TapoMenu"
 /usr/bin/codesign --force --deep --sign - "$app"
 
 if [[ -e $destination ]]; then

@@ -4,18 +4,17 @@
 import ast
 import hashlib
 import io
-import json
 import os
 from pathlib import Path
+import re
 import runpy
+import signal
 import stat
 import sys
 import tempfile
+import threading
 from urllib.request import urlopen
 from zipfile import ZipFile
-
-from camera_status import is_lan_ipv4
-
 
 WHEEL_URL = (
     "https://files.pythonhosted.org/packages/0c/c3/"
@@ -36,39 +35,6 @@ def private_path(path, *, directory=False):
     expected = stat.S_ISDIR if directory else stat.S_ISREG
     if not expected(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
         raise OSError(f"Check that {path} belongs to you and has private permissions.")
-
-
-def local_config(app_directory):
-    app_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    private_path(app_directory, directory=True)
-    config = app_directory / "config.json"
-    try:
-        private_path(config)
-        return config
-    except FileNotFoundError:
-        pass
-
-    print("Enter the local IPv4 address of each camera.")
-    hosts = []
-    for camera_id in ("1", "2"):
-        while True:
-            host = input(f"Cam {camera_id} IPv4 address: ").strip()
-            if is_lan_ipv4(host) and host not in hosts:
-                hosts.append(host)
-                break
-            print("Enter a distinct private IPv4 address for each camera.")
-
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=app_directory) as file:
-        cameras = [{"id": str(index), "host": host} for index, host in enumerate(hosts, start=1)]
-        json.dump({"cameras": cameras}, file, indent=2)
-        file.write("\n")
-        file.flush()
-        try:
-            os.link(file.name, config)
-        except FileExistsError:
-            pass
-    private_path(config)
-    return config
 
 
 def prepare_cloud_modules(directory):
@@ -95,40 +61,82 @@ def prepare_cloud_modules(directory):
     (directory / "tplinkcloud/__init__.py").touch()
 
 
-def main():
-    if len(sys.argv) != 1 or not sys.stdin.isatty():
-        print("Open this sign-in helper in Terminal to continue.", file=sys.stderr)
-        return 1
-
-    os.umask(0o077)
-    app_directory = Path.home() / "Library/Application Support/Tapo Menu"
+def sign_in(app_directory, attempt):
     scripts = Path(__file__).resolve().parent.parent / "scripts"
     login = scripts / "tapo-login.py"
     if not login.is_file() or not (scripts / "install-credentials.py").is_file():
         print("The Tapo Menu sign-in files are missing. Rebuild the app and try again.", file=sys.stderr)
         return 1
 
-    config = local_config(app_directory)
-    tokens = app_directory / "camera-tokens.json"
-    try:
-        private_path(tokens)
-    except FileNotFoundError:
-        pass
-
-    with tempfile.TemporaryDirectory(prefix="tapo-menu-sign-in-") as directory:
-        prepare_cloud_modules(Path(directory))
+    config = attempt / "config.json"
+    private_path(config)
+    with tempfile.TemporaryDirectory(prefix=".sign-in-", dir=app_directory) as directory:
+        working = Path(directory)
+        tokens = working / "camera-tokens.json"
+        prepare_cloud_modules(working)
         sys.path.insert(0, directory)
-        sys.argv = [str(login), "--config", str(config), "--token-file", str(tokens), "--require-discovery"]
-        runpy.run_path(str(login), run_name="__main__")
-    print("Sign-in complete. You can open either camera from Tapo Menu.")
+        sys.argv = [str(login), "--config", str(config), "--token-file", str(tokens)]
+        if not config.is_file():
+            return 130
+        finished = threading.Event()
+        terminal_thread = threading.get_ident()
+
+        def watch_attempt():
+            while not finished.wait(0.25):
+                if not config.is_file():
+                    # Interrupt this helper only, including if it is waiting on Terminal input.
+                    signal.pthread_kill(terminal_thread, signal.SIGHUP)
+                    return
+
+        watcher = threading.Thread(target=watch_attempt, daemon=True)
+        watcher.start()
+        try:
+            runpy.run_path(str(login), run_name="__main__")
+        finally:
+            finished.set()
+            watcher.join()
+        try:
+            os.replace(tokens, attempt / "camera-tokens.json")
+        except FileNotFoundError:
+            print("The sign-in attempt was canceled in Tapo Menu.")
+            return 130
+    print("Sign-in complete. You can return to Tapo Menu.")
     return 0
 
 
-if __name__ == "__main__":
+def main():
+    if len(sys.argv) != 2 or not re.fullmatch(r"[A-F0-9-]{36}", sys.argv[1]) or not sys.stdin.isatty():
+        print("Choose Sign In from the Tapo Menu icon to continue.", file=sys.stderr)
+        return 1
+
+    os.umask(0o077)
+    app_directory = Path.home() / "Library/Application Support/Tapo Menu"
+    attempt = app_directory / ("sign-in-" + sys.argv[1])
+
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGHUP, interrupted)
+    result = 1
     try:
-        sys.exit(main())
+        private_path(app_directory, directory=True)
+        private_path(attempt, directory=True)
+        result = sign_in(app_directory, attempt)
+    except SystemExit as exc:
+        result = exc.code if isinstance(exc.code, int) and exc.code else 1
     except (EOFError, KeyboardInterrupt):
-        sys.exit(130)
+        print("Tapo sign-in canceled.", file=sys.stderr)
+        result = 130
     except (OSError, ValueError, KeyError):
         print("Could not prepare Tapo sign-in. Check your connection and permissions, then try again.", file=sys.stderr)
-        sys.exit(1)
+    finally:
+        if result:
+            try:
+                (attempt / "failed").touch(mode=0o600)
+            except OSError:
+                pass
+    return result
+
+
+if __name__ == "__main__":
+    sys.exit(main())

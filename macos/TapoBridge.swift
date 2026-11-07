@@ -2,14 +2,17 @@ import Foundation
 
 struct CameraStatus: Decodable {
     let id: String
+    let host: String
     let batteryPercent: Int?
     let charging: Bool?
     let online: Bool
+    let checkedAt: TimeInterval?
+    let hasCredentials: Bool
 }
 
 struct MenuStatus: Decodable {
     let cameras: [CameraStatus]
-    let hasCredentials: Bool
+    let probeFailed: Bool
 }
 
 final class TapoBridge {

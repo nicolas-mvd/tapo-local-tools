@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 
 struct JPEGFrames {
     private static let start = Data([0xff, 0xd8])
@@ -28,13 +29,15 @@ struct JPEGFrames {
 
 private final class LiveFeed: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     let onFrame: (Data) -> Void
-    let onFinish: (String) -> Void
+    let onFinish: (String, Bool) -> Void
     private var session: URLSession?
     private var frames = JPEGFrames()
     private var statusCode: Int?
     private var deliveredFrame = false
+    private let frameLock = NSLock()
+    private var pendingFrame: Data?
 
-    init(onFrame: @escaping (Data) -> Void, onFinish: @escaping (String) -> Void) {
+    init(onFrame: @escaping (Data) -> Void, onFinish: @escaping (String, Bool) -> Void) {
         self.onFrame = onFrame
         self.onFinish = onFinish
     }
@@ -65,24 +68,48 @@ private final class LiveFeed: NSObject, URLSessionDataDelegate, @unchecked Senda
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let frame = frames.append(data) else { return }
         deliveredFrame = true
-        DispatchQueue.main.async { [onFrame] in onFrame(frame) }
+        frameLock.lock()
+        let needsDelivery = pendingFrame == nil
+        pendingFrame = frame
+        frameLock.unlock()
+        if needsDelivery {
+            DispatchQueue.main.async { [weak self] in self?.deliverFrame() }
+        }
+    }
+
+    private func deliverFrame() {
+        frameLock.lock()
+        let frame = pendingFrame
+        pendingFrame = nil
+        frameLock.unlock()
+        if let frame { onFrame(frame) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         let text: String
+        let canReconnect: Bool
         switch statusCode {
-        case 401, 403: text = "Sign in again from the Tapo Menu icon to refresh camera access."
-        case 409: text = "Set up your cameras from the Tapo Menu icon."
-        case 503: text = "The local video decoder is unavailable."
-        case 502: text = "The camera did not start video. Wake it and try again."
+        case 401, 403:
+            text = "Sign in again from Tapo Menu to refresh camera access."
+            canReconnect = false
+        case 404, 409, 500:
+            text = "Check this camera’s configuration in Settings."
+            canReconnect = false
+        case 503:
+            text = "The local video decoder is unavailable. Rebuild Tapo Menu with FFmpeg."
+            canReconnect = false
+        case 502:
+            text = "The camera did not start video. Wake it and check its network connection."
+            canReconnect = true
         default:
+            canReconnect = true
             if !deliveredFrame {
                 text = "No video frame arrived. Wake the camera and try again."
             } else {
                 text = error == nil ? "Live view ended." : "Live view disconnected."
             }
         }
-        DispatchQueue.main.async { [onFinish] in onFinish(text) }
+        DispatchQueue.main.async { [onFinish] in onFinish(text, canReconnect) }
         session.finishTasksAndInvalidate()
     }
 }
@@ -102,7 +129,12 @@ final class LiveWindow: NSObject, NSWindowDelegate {
     private var generation = UUID()
     private var startupMessage: DispatchWorkItem?
     private var startupTimeout: DispatchWorkItem?
-    private var retry: (() -> Void)?
+    private var reconnectTask: DispatchWorkItem?
+    private var stallTimer: Timer?
+    private var lastFrameAt: TimeInterval?
+    private var makeRequest: (() -> URLRequest?)?
+    private var cameraName = ""
+    private var attempts = 0
 
     override init() {
         super.init()
@@ -144,37 +176,46 @@ final class LiveWindow: NSObject, NSWindowDelegate {
         window.center()
     }
 
-    func show(camera: String, request: URLRequest, onRetry: @escaping () -> Void) {
+    func show(camera: String, makeRequest: @escaping () -> URLRequest?) {
         stop()
-        retry = onRetry
-        window.title = "Cam \(camera) · Live"
+        self.makeRequest = makeRequest
+        cameraName = camera
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        connect(reconnecting: false)
+    }
+
+    private func connect(reconnecting: Bool) {
+        window.title = "\(cameraName) · \(reconnecting ? "Reconnecting" : "Connecting")"
         imageView.image = nil
-        label.stringValue = "Connecting to Cam \(camera)…"
+        label.stringValue = "\(reconnecting ? "Reconnecting" : "Connecting") to \(cameraName)…"
         overlay.isHidden = false
         spinner.isHidden = false
         spinner.startAnimation(nil)
         retryButton.isHidden = true
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        guard let request = makeRequest?() else {
+            interrupted("The local camera connection could not start. Try again after checking Node.js.", retry: true)
+            return
+        }
         let current = generation
         let feed = LiveFeed(onFrame: { [weak self] bytes in
-            guard let self, self.generation == current, let frame = NSImage(data: bytes) else { return }
-            self.imageView.image = frame
-            self.clearStartup()
-            self.spinner.stopAnimation(nil)
-            self.overlay.isHidden = true
-        }, onFinish: { [weak self] message in
+            guard let self, self.generation == current,
+                  let source = CGImageSourceCreateWithData(bytes as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return }
+            self.present(image)
+        }, onFinish: { [weak self] message, canReconnect in
             guard let self, self.generation == current else { return }
-            self.showFailure(message)
+            self.interrupted(message, retry: canReconnect)
         })
         self.feed = feed
         let message = DispatchWorkItem { [weak self] in
             guard let self, self.generation == current else { return }
-            self.label.stringValue = "Waiting for video from Cam \(camera)…"
+            self.label.stringValue = "Waiting for video from \(self.cameraName)…"
         }
         let timeout = DispatchWorkItem { [weak self] in
             guard let self, self.generation == current else { return }
-            self.showFailure("No video frame arrived. Wake the camera and try again.")
+            self.interrupted("No video frame arrived. Wake the camera and try again.", retry: true)
         }
         startupMessage = message
         startupTimeout = timeout
@@ -183,16 +224,66 @@ final class LiveWindow: NSObject, NSWindowDelegate {
         feed.start(request)
     }
 
-    func showFailure(_ message: String) {
-        stop()
+    private func present(_ image: CGImage) {
+        imageView.alphaValue = 1
+        imageView.image = NSImage(cgImage: image, size: .zero)
+        lastFrameAt = ProcessInfo.processInfo.systemUptime
+        guard stallTimer == nil else { return }
+        clearStartup()
+        spinner.stopAnimation(nil)
+        overlay.isHidden = true
+        window.title = "\(cameraName) · Live"
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let lastFrameAt = self.lastFrameAt,
+                  ProcessInfo.processInfo.systemUptime - lastFrameAt >= 8 else { return }
+            self.interrupted("Video stalled.", retry: true)
+        }
+        stallTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func connectionLost() {
+        if feed != nil { interrupted("The local camera connection stopped.", retry: true) }
+    }
+
+    private func interrupted(_ message: String, retry: Bool) {
+        cancelConnection()
+        guard window.isVisible, !window.isMiniaturized else { return }
+        if retry && attempts < 2 {
+            attempts += 1
+            imageView.alphaValue = 0.35
+            window.title = "\(cameraName) · Reconnecting"
+            label.stringValue = "\(message) Reconnecting…"
+            overlay.isHidden = false
+            spinner.isHidden = false
+            spinner.startAnimation(nil)
+            retryButton.isHidden = true
+            let current = generation
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.generation == current else { return }
+                self.connect(reconnecting: true)
+            }
+            reconnectTask = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(attempts * 2), execute: work)
+            return
+        }
+        showFailure(message)
+    }
+
+    private func showFailure(_ message: String) {
+        window.title = "\(cameraName) · Paused"
         imageView.image = nil
         label.stringValue = message
         overlay.isHidden = false
         spinner.isHidden = true
-        retryButton.isHidden = retry == nil
+        retryButton.isHidden = makeRequest == nil
     }
 
-    @objc private func retryClicked() { retry?() }
+    @objc private func retryClicked() {
+        cancelConnection()
+        attempts = 0
+        connect(reconnecting: false)
+    }
 
     private func clearStartup() {
         startupMessage?.cancel()
@@ -201,19 +292,34 @@ final class LiveWindow: NSObject, NSWindowDelegate {
         startupTimeout = nil
     }
 
-    func stop() {
+    private func cancelConnection() {
         generation = UUID()
         clearStartup()
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        stallTimer?.invalidate()
+        stallTimer = nil
+        lastFrameAt = nil
         spinner.stopAnimation(nil)
         feed?.stop()
         feed = nil
     }
 
+    func stop() {
+        cancelConnection()
+        makeRequest = nil
+        attempts = 0
+    }
+
+    func close() {
+        window.close()
+    }
+
     func windowWillClose(_ notification: Notification) {
         stop()
-        retry = nil
     }
     func windowDidMiniaturize(_ notification: Notification) {
+        cancelConnection()
         showFailure("Live view paused.")
     }
 }

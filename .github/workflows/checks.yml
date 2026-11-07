@@ -1,0 +1,63 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recorder:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg shellcheck
+      - run: npm ci --ignore-scripts
+      - run: shellcheck install.sh macos/build.sh
+      - run: node --test test/*.test.cjs
+      - run: python3 -m unittest discover -s test -p '*_test.py'
+
+  nixos:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
+      - run: nix build --no-link ".#packages.${{ matrix.system }}.default"
+      - if: matrix.system == 'x86_64-linux'
+        run: |
+          sudo chmod a+rw /dev/kvm
+          nix build --no-link --print-build-logs .#checks.x86_64-linux.recorder-service
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - run: command -v ffmpeg || brew install ffmpeg
+      - run: |
+          app="$RUNNER_TEMP/Tapo Menu.app"
+          bash macos/build.sh "$app"
+          codesign --verify --strict --deep "$app"
+          TAPO_MAC_RESOURCES="$app/Contents/Resources" node --test test/mac-bridge.test.cjs
+          /usr/bin/python3 -m unittest discover -s test -p 'mac_signin_test.py'

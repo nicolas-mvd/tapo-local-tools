@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Read the two configured Tapo cameras' battery status via LAN discovery."""
+"""Read configured Tapo cameras' battery status via LAN discovery."""
 
 import argparse
 import ipaddress
 import json
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -24,14 +25,14 @@ LAN_NETWORKS = tuple(map(ipaddress.IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", 
 
 def load_cameras(config_path, hosts):
     if config_path is None:
-        return tuple(zip(("1", "2"), hosts))
+        return tuple((str(index), host) for index, host in enumerate(hosts, start=1))
     with config_path.open("rb") as source:
         data = source.read(65537)
     if len(data) > 65536:
         raise ValueError("camera configuration is too large")
     cameras = json.loads(data)["cameras"]
-    if not isinstance(cameras, list) or len(cameras) != 2:
-        raise ValueError("expected two configured cameras")
+    if not isinstance(cameras, list):
+        raise ValueError("expected a list of configured cameras")
     return tuple((camera["id"], camera["host"]) for camera in cameras)
 
 
@@ -44,14 +45,18 @@ def is_lan_ipv4(host):
 
 
 def validate_cameras(cameras):
+    if not 1 <= len(cameras) <= 16:
+        raise ValueError("expected 1 to 16 configured cameras")
     result = {}
+    ids = set()
     for camera_id, host in cameras:
         if not isinstance(camera_id, str) or not isinstance(host, str):
             raise ValueError("camera ID and host must be strings")
         if not is_lan_ipv4(host):
             raise ValueError("camera address must be private IPv4")
-        if camera_id not in ("1", "2") or host in result:
-            raise ValueError("expected distinct camera addresses and IDs 1 and 2")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,23}", camera_id) or camera_id in ids or host in result:
+            raise ValueError("expected distinct camera addresses and IDs")
+        ids.add(camera_id)
         result[host] = {
             "id": camera_id,
             "host": host,
@@ -59,8 +64,6 @@ def validate_cameras(cameras):
             "charging": None,
             "online": False,
         }
-    if {camera["id"] for camera in result.values()} != {"1", "2"}:
-        raise ValueError("expected camera IDs 1 and 2")
     return result
 
 
@@ -115,14 +118,14 @@ def discover(status):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, help="recorder JSON config with camera IDs and IPs")
-    parser.add_argument("hosts", nargs="*", help="camera 1 and camera 2 IPs when --config is omitted")
+    parser.add_argument("hosts", nargs="*", help="private camera IPs when --config is omitted")
     args = parser.parse_args()
-    if len(args.hosts) != (2 if args.config is None else 0):
-        parser.error("provide either a config or exactly two camera IPs")
+    if bool(args.hosts) == bool(args.config):
+        parser.error("provide either a config or camera IPs")
     try:
         status = validate_cameras(load_cameras(args.config, args.hosts))
     except (KeyError, OSError, TypeError, ValueError):
-        parser.error("expected a valid configuration for cameras 1 and 2")
+        parser.error("expected 1 to 16 distinct cameras with private IPv4 addresses")
     try:
         discover(status)
     except (OSError, subprocess.SubprocessError):

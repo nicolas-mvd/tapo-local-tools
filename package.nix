@@ -10,6 +10,7 @@
   fetchPypi,
   openssl,
   python3,
+  systemd,
   util-linux,
 }:
 
@@ -51,10 +52,12 @@ buildNpmPackage {
       ./package-lock.json
       ./install.sh
       ./src/cli.cjs
+      ./src/archive.cjs
       ./src/media.cjs
       ./src/record.cjs
       ./watch_detection.py
       ./scripts/install-credentials.py
+      ./scripts/configure.py
       ./scripts/tapo-login.py
     ];
   };
@@ -75,7 +78,9 @@ buildNpmPackage {
     cp LICENSE THIRD-PARTY-NOTICES "$out/share/doc/tapo-motion-recorder/"
     makeWrapper ${nodejs_22}/bin/node "$out/bin/tapo-motion-recorder" \
       --add-flags "$app/src/cli.cjs" \
-      --prefix PATH : "${lib.makeBinPath [ ffmpeg-headless openssl python3 ]}"
+      --prefix PATH : "${lib.makeBinPath [ ffmpeg-headless openssl python3 systemd ]}"
+    makeWrapper "$out/bin/tapo-motion-recorder" "$out/bin/tapo-status" --add-flags --status
+    makeWrapper "$out/bin/tapo-motion-recorder" "$out/bin/tapo-doctor" --add-flags --doctor
     makeWrapper ${python3}/bin/python3 "$out/bin/tapo-install-credentials" \
       --add-flags "$app/scripts/install-credentials.py"
     makeWrapper ${loginPython}/bin/python3 "$out/bin/tapo-login" \
@@ -86,6 +91,7 @@ buildNpmPackage {
       --add-flags "$app/install.sh" \
       --set TAPO_INSTALL_PACKAGE "$out" \
       --prefix PATH : "${lib.makeBinPath [ coreutils util-linux python3 ]}"
+    makeWrapper "$out/bin/tapo-install" "$out/bin/tapo-refresh" --add-flags --refresh-tokens
 
     runHook postInstall
   '';
@@ -93,6 +99,7 @@ buildNpmPackage {
   meta = {
     description = "Record Tapo motion clips on the local network";
     mainProgram = "tapo-motion-recorder";
+    license = lib.licenses.gpl3Only;
     platforms = lib.platforms.linux;
   };
 }

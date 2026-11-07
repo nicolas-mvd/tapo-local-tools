@@ -23,6 +23,7 @@ const boundary = 'tapo-frame';
 const cacheDuration = 8_000;
 const firstFrameTimeout = 30_000;
 const jpegEnd = Buffer.from([0xff, 0xd9]);
+const cameraId = /^[A-Za-z0-9][A-Za-z0-9-]{0,23}$/;
 
 let statusCache;
 let stopActiveStream;
@@ -56,12 +57,13 @@ function cameraConfig() {
     if (error.code === 'ENOENT') return null;
     throw error;
   }
-  if (!Array.isArray(cameras) || cameras.length !== 2
-      || !['1', '2'].every((id) => cameras.some((camera) => camera?.id === id && isLanIp(camera.host)))
-      || cameras[0].host === cameras[1].host) {
+  if (!Array.isArray(cameras) || !cameras.length || cameras.length > 16
+      || cameras.some((camera) => typeof camera?.id !== 'string' || !cameraId.test(camera.id) || !isLanIp(camera.host))
+      || new Set(cameras.map(({ id }) => id)).size !== cameras.length
+      || new Set(cameras.map(({ host }) => host)).size !== cameras.length) {
     throw new Error('Invalid camera configuration');
   }
-  return ['1', '2'].map((id) => ({ id, host: cameras.find((camera) => camera.id === id).host }));
+  return cameras.map(({ id, host }) => ({ id, host }));
 }
 
 function readTokens() {
@@ -81,17 +83,18 @@ function credentialFor(camera, tokens) {
 
 async function fetchStatus(cameras) {
   const args = [path.join(__dirname, 'camera_status.py'), '--config', configPath];
-  let replies = [];
+  let replies;
   try {
     const { stdout } = await execute(python, args, {
       timeout: 6_000, maxBuffer: 65_536, signal: shutdown.signal,
     });
-    const parsed = JSON.parse(stdout);
-    if (Array.isArray(parsed)) replies = parsed;
+    replies = JSON.parse(stdout);
+    if (!Array.isArray(replies)) throw new Error('Invalid discovery response');
   } catch {
-    // Report missing readings without exposing child output to the UI.
+    return { cameras: cameras.map((camera) => ({ ...camera, online: false })), probeFailed: true };
   }
-  return cameras.map((camera) => {
+  const checkedAt = Date.now() / 1_000;
+  const readings = cameras.map((camera) => {
     const reading = replies.find((reply) => reply?.id === camera.id && reply.host === camera.host);
     const battery = reading?.batteryPercent;
     return {
@@ -99,8 +102,10 @@ async function fetchStatus(cameras) {
       batteryPercent: Number.isInteger(battery) && battery >= 0 && battery <= 100 ? battery : null,
       charging: typeof reading?.charging === 'boolean' ? reading.charging : null,
       online: reading?.online === true,
+      checkedAt,
     };
   });
+  return { cameras: readings, probeFailed: false };
 }
 
 function cameraStatus(cameras) {
@@ -247,26 +252,33 @@ function main() {
       if (request.url === '/status') {
         const cameras = cameraConfig();
         if (!cameras) {
-          json(response, 200, { cameras: [], hasCredentials: false });
+          json(response, 200, { cameras: [], probeFailed: false });
           return;
         }
         const status = await cameraStatus(cameras);
         if (response.destroyed) return;
         const tokens = readTokens();
         json(response, 200, {
-          cameras: status,
-          hasCredentials: cameras.every((camera) => credentialFor(camera, tokens)),
+          ...status,
+          cameras: status.cameras.map((camera) => ({
+            ...camera, hasCredentials: Boolean(credentialFor(camera, tokens)),
+          })),
         });
         return;
       }
-      const match = /^\/live\/([12])$/.exec(request.url);
+      const match = /^\/live\/([A-Za-z0-9][A-Za-z0-9-]{0,23})$/.exec(request.url);
       if (match) {
         const cameras = cameraConfig();
         if (!cameras) {
           json(response, 409, { error: 'Set up Tapo Menu before opening a preview.' });
           return;
         }
-        await streamCamera(cameras.find((camera) => camera.id === match[1]), response);
+        const camera = cameras.find(({ id }) => id === match[1]);
+        if (!camera) {
+          json(response, 404, { error: 'This camera is no longer configured.' });
+          return;
+        }
+        await streamCamera(camera, response);
       } else {
         json(response, 404, { error: 'Unknown preview path.' });
       }
